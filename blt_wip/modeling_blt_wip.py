@@ -17,7 +17,6 @@ import torch.nn
 import torch.nn as nn
 from pydantic import ConfigDict
 from torch.nn import functional as F
-from xformers.ops import AttentionBias, fmha
 
 import abc
 
@@ -26,15 +25,22 @@ import time
 from collections import defaultdict
 
 from pydantic import BaseModel
-from bytelatent.tokenizers.constants import BOE_ID, BOS_ID, EOS_ID, OFFSET, PAD_ID
+
+SEP = " "
+BOS_ID: int = 1
+EOS_ID: int = 2
+PAD_ID: int = -1
+BOE_ID: int = 0
+BPE_ID: int = 3
+OFFSET: int = 4
+
+BYTE_UNITS: int = 256
 
 RMSNorm = nn.RMSNorm
 
-from bytelatent.distributed import get_local_rank
-
 logger = logging.getLogger()
 
-from blt_args import (
+from .blt_args import (
     BaseTransformerArgs,
     ByteLatentTransformerArgs,
     GlobalTransformerArgs,
@@ -43,8 +49,6 @@ from blt_args import (
     LMTransformerArgs,
 
 )
-
-
 
 if int(os.environ.get("BLT_ALLOW_MISSING_FLEX_ATTENTION", False)) == 0:
     flex_attention_comp = torch.compile(flex_attention)
@@ -115,31 +119,7 @@ def create_causal_mask(
     tokens: torch.Tensor | None = None,
     sliding_window: int | None = None,
 ):
-    if attn_impl == "xformers":
-        if attn_bias_type is None:
-            return fmha.attn_bias.LowerTriangularMask()
-        elif attn_bias_type == "causal":
-            assert sliding_window is None
-            return fmha.attn_bias.LowerTriangularMask()
-        elif attn_bias_type == "block_causal":
-            assert sliding_window is None
-            assert eos_id is not None
-            assert tokens is not None
-            return fmha.attn_bias.BlockDiagonalCausalMask.from_seqlens(
-                q_seqlen=tokens_to_seqlen(tokens, eos_id)
-            )
-        elif attn_bias_type == "local_block_causal":
-            assert sliding_window is not None
-            assert eos_id is not None
-            assert tokens is not None
-            return fmha.attn_bias.BlockDiagonalCausalMask.from_seqlens(
-                q_seqlen=tokens_to_seqlen(tokens, eos_id)
-            ).make_local_attention(sliding_window)
-        else:
-            return fmha.attn_bias.LocalAttentionFromBottomRightMask(
-                window_left=sliding_window - 1, window_right=0
-            )
-    elif attn_impl == "sdpa":
+    if attn_impl == "sdpa":
         BLT_SUPPRESS_ATTN_ERROR = int(os.environ.get("BLT_SUPPRESS_ATTN_ERROR", 0))
 
         if attn_bias_type == "causal":
@@ -153,8 +133,6 @@ def create_causal_mask(
             )
     elif attn_impl == "flex_attention":
         return create_block_mask(causal_mask, None, None, seqlen, seqlen)
-    elif attn_impl == "fmha":
-        return None
     else:
         raise NotImplementedError(
             f"Attention {attn_impl} with {sliding_window} sliding window not implemented"
@@ -326,11 +304,11 @@ class RotaryEmbedding(torch.nn.Module):
 
 
 def _reshape_for_attn_bias(
-    attn_bias: AttentionBias | None,
+    attn_bias: None,
     *tensors: torch.Tensor,
 ) -> list[torch.Tensor]:
     to_transform = list(tensors)
-    if isinstance(attn_bias, fmha.attn_bias.BlockDiagonalCausalMask):
+    if isinstance(attn_bias):
         # could be `view` instead of reshape during training, but for inference
         # have to reshape due to strides mismatch
         to_transform = [t.reshape(1, -1, *t.shape[2:]) for t in to_transform]
@@ -383,7 +361,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         freq_cis: torch.Tensor,
         tok_idx: Optional[torch.Tensor] = None,
-        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        mask: Optional[Union[BlockMask, str]] = None,
         attn_impl: str = "sdpa",
     ) -> torch.Tensor:
         # B S D
@@ -413,14 +391,6 @@ class Attention(nn.Module):
             xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
             output = flex_attention_comp(xq, xk, xv, block_mask=mask)
             output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
-
-        elif attn_impl == "xformers":
-            assert mask is None or isinstance(mask, AttentionBias)
-            query_shape = xq.shape
-            xq, xk, xv = _reshape_for_attn_bias(mask, xq, xk, xv)
-            output = fmha.memory_efficient_attention(xq, xk, xv, attn_bias=mask)
-            output = output.view(query_shape)
-            # This uses B S H D instead of B H S D of pytorch
 
         elif attn_impl == "sdpa":
             xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
@@ -572,7 +542,7 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         freq_cis: torch.Tensor,
         tok_idx: Optional[torch.Tensor] = None,
-        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        mask: Optional[Union[BlockMask, str]] = None,
         attn_impl: str = "sdpa",
     ) -> torch.Tensor:
         norm_x = self.attention_norm(x)
@@ -630,7 +600,7 @@ class BaseTransformer(nn.Module, SequenceModelWithOutput):
         self,
         h,
         tok_idx: Optional[torch.Tensor] = None,
-        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        mask: Optional[Union[BlockMask, str]] = None,
         attn_impl: str = "sdpa",
     ):
 
@@ -699,7 +669,7 @@ class LMTransformer(
         token_values: torch.Tensor,
         target: Optional[torch.Tensor] = None,
         tok_idx: Optional[torch.Tensor] = None,
-        mask: Optional[Union[BlockMask, AttentionBias, torch.Tensor, str]] = None,
+        mask: Optional[Union[BlockMask, torch.Tensor, str]] = None,
         attn_impl: str | None = None,
     ):
         if attn_impl is None:
@@ -845,7 +815,8 @@ class Patcher:
                 patcher_args.entropy_model_checkpoint_dir,
                 state_path,
             )
-            entropy_model, _ = to_device(entropy_model, patcher_args.patching_device)
+          #  entropy_model, _ = to_device(entropy_model, patcher_args.patching_device)
+            entropy_model = entropy_model.to(patcher_args.patching_device)
             self.entropy_model = entropy_model
         else:
             self.entropy_model = None
@@ -1524,7 +1495,7 @@ class LocalEncoder(LocalModelBase):
         tokens: torch.Tensor,
         embeds: Optional[torch.Tensor] = None,
         patch_embeds: Optional[torch.Tensor] = None,
-        mask: Optional[Union["BlockMask", "AttentionBias", torch.Tensor, str]] = None,
+        mask: Optional[Union["BlockMask", torch.Tensor, str]] = None,
         cross_mask: Optional[torch.Tensor] = None,
         num_patches: Optional[int] = None,
         patch_ids: Optional[torch.Tensor] = None,
@@ -1625,7 +1596,7 @@ class LocalDecoder(LocalModelBase):
         tokens: torch.Tensor,
         embeds: Optional[torch.Tensor],
         patch_embeds: Optional[torch.Tensor] = None,
-        mask: Optional[Union["BlockMask", "AttentionBias", torch.Tensor, str]] = None,
+        mask: Optional[Union["BlockMask", torch.Tensor, str]] = None,
         cross_mask: Optional[torch.Tensor] = None,
         cache: Optional[List[Tuple[torch.Tensor, torch.Tensor, int]]] = None,
     ):
@@ -1731,7 +1702,7 @@ class CrossAttention(nn.Module):
         self,
         x: torch.Tensor,
         kv: torch.Tensor,
-        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        mask: Optional[Union[BlockMask, str]] = None,
     ) -> torch.Tensor:
         # B S D
         bsz, seq_len, _ = x.shape
@@ -1819,7 +1790,7 @@ class GlobalTransformer(BaseTransformer):
         tokens: torch.Tensor,
         tok_idx: Optional[torch.Tensor] = None,
         embeds: Optional[torch.Tensor] = None,
-        mask: Optional[Union[BlockMask, AttentionBias, torch.Tensor, str]] = None,
+        mask: Optional[Union[BlockMask, torch.Tensor, str]] = None,
         cache: Optional[List[Tuple[torch.Tensor, torch.Tensor, int]]] = None,
     ):
         """

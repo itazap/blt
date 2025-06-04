@@ -1,31 +1,26 @@
-#demo_hf.py
-
 import os
 
 import torch
 import typer
 
-from blt_one_file import ByteLatentTransformer, ByteLatentTransformerArgs
+from blt_wip.modeling_blt_wip import ByteLatentTransformer, ByteLatentTransformerArgs
 from bytelatent.tokenizers.blt_tokenizer import BltTokenizer
 
 from huggingface_hub import hf_hub_download
 import json
-#generatel_blt_consolidated.py
 
 import logging
 import os
 
 import torch
 
-from blt_one_file import Patcher
-from bytelatent.distributed import (
-    dist_max,
-    dist_min,
-)
-from blt_one_file import ByteLatentTransformer
+from blt_wip.modeling_blt_wip import Patcher, ByteLatentTransformer
 from bytelatent.tokenizers.blt_tokenizer import BltTokenizer
 
 logger = logging.getLogger()
+
+import os
+os.environ["BLT_SUPPRESS_ATTN_ERROR"] = "1"
 
 def get_generation_range(
     prompt_tokens: list[list[int]] | None, max_gen_len: int
@@ -152,10 +147,11 @@ def main(prompt: str = "my name is", model_name: str = "blt-1b"):
     with open(entropy_params_path, 'r') as f:
         entropy_params = json.load(f)
     
-    # Create model args from config
+    config['args']['attn_bias_type'] = 'causal'
+    config['args']['attn_impl'] = 'sdpa'
+
     model_args = ByteLatentTransformerArgs(**config["args"])
     
-    # Update patch parameters from entropy model params
     patcher_args = entropy_params["data"]["patcher_args"]
     model_args.patch_in_forward = True
     model_args.patch_size = patcher_args["patch_size"]
@@ -167,8 +163,6 @@ def main(prompt: str = "my name is", model_name: str = "blt-1b"):
     model_args.patching_device = patcher_args["patching_device"]
     model_args.monotonicity = patcher_args["monotonicity"]
     
-    # Load the model with updated arguments
-    print("Loading model with updated arguments...")
     model = ByteLatentTransformer.from_pretrained(blt_repo, args=model_args).to(device)
     
     # Configure model's patcher
@@ -177,26 +171,23 @@ def main(prompt: str = "my name is", model_name: str = "blt-1b"):
         "hf-weights", "entropy_model"
     )
 
-    # Create tokenizer
     tokenizer = BltTokenizer(
         vocab_size_unit_1=model_args.vocab_size,
         add_bos=True,
         add_eos=True
     )
 
-    # Generate text
-    print("Generating text...")
+    prompts = [prompt]
     outputs = generate(
-        [prompt], 
+        prompts, 
         model=model, 
         tokenizer=tokenizer, 
         patcher=model.patcher,  # Use the model's patcher
         max_gen_len=100
     )
     
-    # Decode and print results
     text_outputs = [tokenizer.decode(t) for t in outputs]
-    for p, t in zip([prompt], text_outputs):
+    for p, t in zip(prompts, text_outputs):
         print(f'Prompt: "{p}"')
         print(f'Completion: "{t}"')
         print()
@@ -207,4 +198,3 @@ def main(prompt: str = "my name is", model_name: str = "blt-1b"):
 
 if __name__ == "__main__":
     typer.run(main)
-

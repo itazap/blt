@@ -2,7 +2,9 @@ from enum import Enum, auto
 from typing import Any, List, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict, model_validator
 from typing_extensions import Self
-from bytelatent.tokenizers.constants import BOE_ID, BOS_ID, EOS_ID, OFFSET, PAD_ID
+
+EOS_ID: int = 2
+
 
 class InitStdFactor(str, Enum):
     DISABLED = "disabled"  # Init std is divided by 1.0
@@ -12,7 +14,7 @@ class InitStdFactor(str, Enum):
 
 
 class BaseTransformerArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict()
     dim: int = 512
     n_layers: int = 8
     head_dim: int | None = None
@@ -211,7 +213,7 @@ class LocalDecoderArgs(ByteLatentTransformerArgs):
 
 
 class LocalModelArgs(BaseTransformerArgs):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict()
     # Override defaults
     attn_impl: str | None = "xformers"
     attn_bias_type: str | None = "local_block_causal"
